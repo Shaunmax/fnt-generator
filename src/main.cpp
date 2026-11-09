@@ -730,7 +730,7 @@ int main(int, char**) {
             ImGui::PopStyleVar();
 
             // Left Panel (Settings)
-            ImGui::BeginChild("Settings", ImVec2(300, 0), true);
+            ImGui::BeginChild("Settings", ImVec2(340, 0), true);
             
             ImGui::TextDisabled("Configuration");
             ImGui::Separator();
