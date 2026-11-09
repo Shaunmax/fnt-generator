@@ -16,7 +16,9 @@
 #include <sstream>
 #include <filesystem>
 #include <algorithm>
+#include <functional>
 #include <iostream>
+#include <iterator>
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
@@ -172,6 +174,70 @@ void UpdatePatternPreviewTexture() {
     }
 }
 
+static const std::string kBase64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string EncodeBase64(const std::vector<uint8_t>& data) {
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t n = data[i] << 16;
+        if (i + 1 < data.size()) n |= data[i + 1] << 8;
+        if (i + 2 < data.size()) n |= data[i + 2];
+        out += kBase64Alphabet[(n >> 18) & 63];
+        out += kBase64Alphabet[(n >> 12) & 63];
+        out += i + 1 < data.size() ? kBase64Alphabet[(n >> 6) & 63] : '=';
+        out += i + 2 < data.size() ? kBase64Alphabet[n & 63] : '=';
+    }
+    return out;
+}
+
+static bool DecodeBase64(const std::string& in, std::vector<uint8_t>& out) {
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (char ch : in) {
+        size_t value = kBase64Alphabet.find(ch);
+        if (value == std::string::npos) continue; // Skips '=' padding and whitespace
+        buffer = (buffer << 6) | (uint32_t)value;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t)((buffer >> bits) & 0xFF));
+        }
+    }
+    return !out.empty();
+}
+
+static bool ReadFileBytes(const std::string& path, std::vector<uint8_t>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return false;
+    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return !out.empty();
+}
+
+// Writes an image restored from a project file to the config cache and returns its path (empty on failure)
+static std::string WriteEmbeddedGlyphImage(const std::vector<uint8_t>& bytes, const std::string& originalPath) {
+    std::string dir = GetConfigDir() + "/glyph_cache";
+    if (!std::filesystem::exists(dir)) std::filesystem::create_directories(dir);
+
+    std::string name = std::to_string(std::hash<std::string>{}(std::string(bytes.begin(), bytes.end())));
+    std::string path = dir + "/" + name + std::filesystem::path(originalPath).extension().string();
+    if (!std::filesystem::exists(path)) {
+        std::ofstream out(path, std::ios::binary);
+        if (!out.is_open()) return "";
+        out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+    }
+    return path;
+}
+
+// Quotes a string as a JSON literal. Control characters other than newline are dropped first:
+// they can't be glyphs, and the hand-written loader doesn't decode \uXXXX escapes.
+static std::string JsonQuote(std::string s) {
+    s.erase(std::remove_if(s.begin(), s.end(), [](char c) {
+        return (unsigned char)c < 0x20 && c != '\n' && c != '\t';
+    }), s.end());
+    return nlohmann::json(s).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 void SaveStyle(const std::string& path) {
     std::ofstream out(path);
     if (!out.is_open()) return;
@@ -246,12 +312,7 @@ void SaveStyle(const std::string& path) {
         std::string pathAndIndex = ""; // Not used, just logic
         std::string savePath = !g_OriginalPatternPath.empty() ? g_OriginalPatternPath : g_PatternPath;
         
-        std::string escapedPath;
-        for(char c : savePath) {
-            if(c == '\\') escapedPath += "\\\\";
-            else escapedPath += c;
-        }
-        out << "  \"patternPath\": \"" << escapedPath << "\",\n";
+        out << "  \"patternPath\": " << JsonQuote(savePath) << ",\n";
         out << "  \"patternIndex\": " << g_SelectedPatternIndex << ",\n";
     }
     out << "  \"patternOpacity\": " << g_PatternOpacity << ",\n";
@@ -260,65 +321,44 @@ void SaveStyle(const std::string& path) {
     out << "  \"patternBlendMode\": " << g_PatternBlendMode << ",\n";
     out << "  \"patternMappingMode\": " << g_PatternMappingMode << ",\n";
 
-    // Replaced Glyphs
+    // Replaced Glyphs (image bytes are embedded so the project still works after the source file moves or is deleted)
     out << "  \"replacedGlyphs\": [\n";
     {
         bool first = true;
         for (const auto& pair : g_ReplacedGlyphs) {
-            if (!first) out << ",\n";
-            std::string escapedPath;
-            for(char c : pair.second.imagePath) {
-                if(c == '\\') escapedPath += "\\\\";
-                else escapedPath += c;
-            }
-            out << "    { \"code\": " << pair.first << ", \"path\": \"" << escapedPath << "\", \"width\": " << pair.second.width << ", \"height\": " << pair.second.height 
-                << ", \"xOffset\": " << pair.second.xOffset << ", \"yOffset\": " << pair.second.yOffset << ", \"advance\": " << pair.second.advance
-                << ", \"applyEffects\": " << (pair.second.applyEffects ? "true" : "false")  
-                << ", \"applyShadow\": " << (pair.second.applyShadow ? "true" : "false") 
-                << ", \"applyStroke\": " << (pair.second.applyStroke ? "true" : "false") 
-                << ", \"applyBevel\": " << (pair.second.applyBevel ? "true" : "false") 
-                << ", \"applyInnerGlow\": " << (pair.second.applyInnerGlow ? "true" : "false") 
+            const ReplacedGlyph& rg = pair.second;
+            nlohmann::json entry = {
+                {"code", pair.first}, {"path", rg.imagePath},
+                {"width", rg.width}, {"height", rg.height},
+                {"xOffset", rg.xOffset}, {"yOffset", rg.yOffset}, {"advance", rg.advance},
+                {"applyEffects", rg.applyEffects}, {"applyShadow", rg.applyShadow},
+                {"applyStroke", rg.applyStroke}, {"applyBevel", rg.applyBevel},
+                {"applyInnerGlow", rg.applyInnerGlow}, {"applyGradient", rg.applyGradient},
+                {"applyPattern", rg.applyPattern}, {"applyFill", rg.applyFill}
+            };
+            std::vector<uint8_t> bytes;
+            if (ReadFileBytes(rg.imagePath, bytes)) entry["imageData"] = EncodeBase64(bytes);
 
-                << ", \"applyPattern\": " << (pair.second.applyPattern ? "true" : "false") 
-                << ", \"applyFill\": " << (pair.second.applyFill ? "true" : "false") 
-                << " }";
+            if (!first) out << ",\n";
+            out << "    " << entry.dump();
             first = false;
         }
     }
     out << "\n  ],\n";
 
-    out << "  \"exportFilename\": \"" << g_ExportFilename << "\",\n";
-    {
-        std::string escaped;
-        for(char c : g_ExportPath) {
-            if(c == '\\') escaped += "\\\\";
-            else escaped += c;
-        }
-        out << "  \"exportPath\": \"" << escaped << "\",\n";
-    }
+    out << "  \"exportFilename\": " << JsonQuote(g_ExportFilename) << ",\n";
+    out << "  \"exportPath\": " << JsonQuote(g_ExportPath) << ",\n";
     out << "  \"ssaaFactor\": " << g_SSAAFactor << ",\n";
     out << "  \"hintingMode\": " << g_HintingMode << ",\n";
     
     // Font Path
     if (g_SelectedFontIndex >= 0 && g_SelectedFontIndex < (int)g_SystemFonts.size()) {
-        std::string fp = g_SystemFonts[g_SelectedFontIndex].path;
-        std::string escaped;
-        for(char c : fp) {
-            if(c == '\\') escaped += "\\\\";
-            else escaped += c;
-        }
-        out << "  \"fontPath\": \"" << escaped << "\",\n";
+        out << "  \"fontPath\": " << JsonQuote(g_SystemFonts[g_SelectedFontIndex].path) << ",\n";
     }
 
     // Fallback Font Path
     if (g_SelectedFallbackFontIndex >= 0 && g_SelectedFallbackFontIndex < (int)g_SystemFonts.size()) {
-        std::string ffp = g_SystemFonts[g_SelectedFallbackFontIndex].path;
-        std::string ffescaped;
-        for(char c : ffp) {
-            if(c == '\\') ffescaped += "\\\\";
-            else ffescaped += c;
-        }
-        out << "  \"fallbackFontPath\": \"" << ffescaped << "\",\n";
+        out << "  \"fallbackFontPath\": " << JsonQuote(g_SystemFonts[g_SelectedFallbackFontIndex].path) << ",\n";
     }
     
     // Excluded Glyphs
@@ -333,14 +373,7 @@ void SaveStyle(const std::string& path) {
     
     // Custom Glyphs
     out << "  \"useCustomGlyphs\": true,\n";
-    std::string escCustom;
-    for(char c : g_CustomGlyphsText) {
-        if(c == '\\') escCustom += "\\\\";
-        else if(c == '"') escCustom += "\\\"";
-        else if(c == '\n') escCustom += "\\n";
-        else escCustom += c;
-    }
-    out << "  \"customGlyphsText\": \"" << escCustom << "\",\n";
+    out << "  \"customGlyphsText\": " << JsonQuote(g_CustomGlyphsText) << ",\n";
     
     // Export Format
     out << "  \"exportFormat\": " << g_ExportFormat << ",\n";
@@ -496,7 +529,9 @@ void LoadStyle(const std::string& path) {
     g_ReplacedGlyphs.clear();
     try {
         auto j = nlohmann::json::parse(c, nullptr, false);
-        if (!j.is_discarded() && j.contains("replacedGlyphs") && j["replacedGlyphs"].is_array()) {
+        if (j.is_discarded()) {
+            std::cerr << "[WARN] Project file is not valid JSON, replaced glyphs not loaded: " << path << std::endl;
+        } else if (j.contains("replacedGlyphs") && j["replacedGlyphs"].is_array()) {
             for (const auto& item : j["replacedGlyphs"]) {
                  if (item.contains("code") && item.contains("path")) {
                      uint32_t code = item["code"];
@@ -512,8 +547,19 @@ void LoadStyle(const std::string& path) {
                      rg.applyStroke = item.value("applyStroke", true);
                      rg.applyBevel = item.value("applyBevel", true);
                      rg.applyInnerGlow = item.value("applyInnerGlow", true);
+                     rg.applyGradient = item.value("applyGradient", true);
                      rg.applyPattern = item.value("applyPattern", true);
                      rg.applyFill = item.value("applyFill", false);
+
+                     // Prefer the embedded copy so the project is self-contained
+                     std::vector<uint8_t> bytes;
+                     if (item.contains("imageData") && DecodeBase64(item["imageData"], bytes)) {
+                         std::string restored = WriteEmbeddedGlyphImage(bytes, rg.imagePath);
+                         if (!restored.empty()) rg.imagePath = restored;
+                     }
+                     if (!std::filesystem::exists(rg.imagePath)) {
+                         std::cerr << "[WARN] Replaced glyph image not found for code " << code << ": " << rg.imagePath << std::endl;
+                     }
                      g_ReplacedGlyphs[code] = rg;
                  }
             }
